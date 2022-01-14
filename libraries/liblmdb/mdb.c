@@ -105,6 +105,7 @@ static NtCloseFunc *NtClose;
 #include <sys/param.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
+#include <sha256.h>
 #ifdef HAVE_SYS_FILE_H
 #include <sys/file.h>
 #endif
@@ -788,6 +789,11 @@ typedef unsigned long long	mdb_hash_t;
 #define CACHELINE	64
 #endif
 
+	/** The size of stored hash value, default 256 bits (i.e., 32 bytes).
+	 * For leaf node the record is stored as (k, v, h), while for branch node the record is stored as (k, h).
+	 */
+#define HASHSIZE 32
+
 	/**	The information we store in a single slot of the reader table.
 	 *	In addition to a transaction ID, we also record the process and
 	 *	thread ID that owns a slot, so that we can detect stale information,
@@ -1086,7 +1092,7 @@ typedef struct MDB_node {
 /** @} */
 	unsigned short	mn_flags;		/**< @ref mdb_node */
 	unsigned short	mn_ksize;		/**< key size */
-	char		mn_data[1];			/**< key and data are appended here */
+	char		mn_data[1];			/**< key and data as well as hash are appended here */
 } MDB_node;
 
 	/** Size of the node header, excluding dynamic data at the end */
@@ -1100,10 +1106,19 @@ typedef struct MDB_node {
 	 */
 #define INDXSIZE(k)	 (NODESIZE + ((k) == NULL ? 0 : (k)->mv_size))
 
+	/** Size of a node in a branch page with a given key and hashing.
+	*/
+#define INDXHSIZE(k, h) (NODESIZE + ((k) == NULL ? 0: (k)->mv_size) + ((h) == NULL ? 0 : (h)->mv_size))
+
 	/** Size of a node in a leaf page with a given key and data.
 	 *	This is node header plus key plus data size.
 	 */
 #define LEAFSIZE(k, d)	 (NODESIZE + (k)->mv_size + (d)->mv_size)
+
+	/** Size of a node in a leaf page with a given key and data as well as the hash.
+	 *
+	 */
+#define LEAFHSIZE(k, d) (NODESIZE + (k)->mv_size + (d)->mv_size + HASHSIZE)
 
 	/** Address of node \b i in page \b p */
 #define NODEPTR(p, i)	 ((MDB_node *)((char *)(p) + (p)->mp_ptrs[i] + PAGEBASE))
@@ -1113,6 +1128,9 @@ typedef struct MDB_node {
 
 	/** Address of the data for a node */
 #define NODEDATA(node)	 (void *)((char *)(node)->mn_data + (node)->mn_ksize)
+
+	/** Address of the hash value for a node */
+#define NODEHASH(node)   (void *)((char *)(node)->mn_data + (node)->mn_ksize + HASHSIZE)
 
 	/** Get the page number pointed to by a branch node */
 #define NODEPGNO(node) \
@@ -1164,6 +1182,10 @@ typedef struct MDB_node {
 	/** Set the \b node's key into \b keyptr, if requested. */
 #define MDB_GET_KEY(node, keyptr)	{ if ((keyptr) != NULL) { \
 	(keyptr)->mv_size = NODEKSZ(node); (keyptr)->mv_data = NODEKEY(node); } }
+
+#define MDB_GET_HASH(node, keyptr)  {if ((keyptr) != NULL) {  \
+    (keyptr)->mv_size = HASHSIZE; (keyptr)->mv_data = NODEHASH(node); } }
+}
 
 	/** Set the \b node's key into \b key. */
 #define MDB_GET_KEY2(node, key)	{ key.mv_size = NODEKSZ(node); key.mv_data = NODEKEY(node); }
@@ -2290,9 +2312,9 @@ mdb_page_spill(MDB_cursor *m0, MDB_val *key, MDB_val *data)
 	/* Named DBs also dirty the main DB */
 	if (m0->mc_dbi >= CORE_DBS)
 		i += txn->mt_dbs[MAIN_DBI].md_depth;
-	/* For puts, roughly factor in the key+data size */
+	/* For puts, roughly factor in the key+data+hash size */
 	if (key)
-		i += (LEAFSIZE(key, data) + txn->mt_env->me_psize) / txn->mt_env->me_psize;
+		i += (LEAFHSIZE(key, data) + txn->mt_env->me_psize) / txn->mt_env->me_psize;
 	i += i;	/* double it for good measure */
 	need = i;
 
@@ -2323,7 +2345,7 @@ mdb_page_spill(MDB_cursor *m0, MDB_val *key, MDB_val *data)
 	 * with a few exceptions for cursor pages and DB root pages. But this
 	 * turns out to be a lot of wasted effort because in a large txn many
 	 * of those pages will need to be used again. So now we spill only 1/8th
-	 * of the dirty pages. Testing revealed this to be a good tradeoff,
+	 * of the dirty pages. Testing revealed this to be a good trade-off,
 	 * better than 1/2, 1/4, or 1/10.
 	 */
 	if (need < MDB_IDL_UM_MAX / 8)
@@ -3861,7 +3883,7 @@ retry_seek:
 	}
 #endif	/* _WIN32 */
 
-	if (!(env->me_flags & MDB_WRITEMAP)) {
+	if (!(env->me_flags & MDB_WRITEMAP)) {`
 		/* Don't free pages when using writemap (can only get here in NOSYNC mode in Windows)
 		 * MIPS has cache coherency issues, this is a no-op everywhere else
 		 * Note: for any size >= on-chip cache size, entire on-chip cache is
@@ -7563,7 +7585,7 @@ mdb_cursor_put(MDB_cursor *mc, MDB_val *key, MDB_val *data,
 	MDB_node	*leaf = NULL;
 	MDB_page	*fp, *mp, *sub_root = NULL;
 	uint16_t	fp_flags;
-	MDB_val		xdata, *rdata, dkey, olddata;
+	MDB_val		xdata, *rdata, dkey, olddata, hash_val;
 	MDB_db dummy;
 	int do_sub = 0, insert_key, insert_data;
 	unsigned int mcount = 0, dcount = 0, nospill;
